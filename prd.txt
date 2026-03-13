@@ -1,1 +1,266 @@
 will fill out
+
+
+---
+
+## Reference Game: Basketball GM (ZenGM) — Deep Research
+
+This section documents Basketball GM as a primary reference and inspiration for what we will build with Soccer GM. Basketball GM is the closest analogue to our vision: a free, browser-based, single-player sports management simulation game. Understanding its design, features, and architecture informs every major decision we make.
+
+---
+
+### 1. What Is Basketball GM?
+
+Basketball GM is a completely free, single-player basketball management simulation game playable entirely in the browser, developed and maintained by ZenGM (an independent game developer). Players take the role of a general manager (GM) of a basketball franchise, tasked with building a championship-winning roster through drafts, trades, free agency signings, and roster management — all while staying within a salary cap and satisfying the team owner.
+
+Key facts:
+- 100% free, no microtransactions, no virtual currency, no pay-to-win mechanics
+- No account required to play
+- Unlimited leagues and seasons
+- Runs entirely client-side (no server-side game logic)
+- As of the most recent annual report: 7 million leagues created, 25 million seasons simulated
+- Sister games on the same engine: Football GM, ZenGM Baseball, ZenGM Hockey
+
+**Why this matters for Soccer GM:** This is the exact product-market fit we are targeting — a free, frictionless, deep management sim for soccer fans.
+
+---
+
+### 2. Core Gameplay Loop
+
+The game is structured around a repeating seasonal cycle:
+
+1. **Preseason** — Players age and develop. Young players improve, older players decline. Coaches adjust lineups.
+2. **Regular Season** — Games are simulated. The player controls pacing (simulate 1 game, 1 week, until playoffs, etc.) via a Play Menu.
+3. **Playoffs** — Top 8 teams per conference enter a bracket. Best-of-7 series until a champion is crowned.
+4. **Draft** — Teams pick incoming prospects in reverse-standings order (worst teams pick first), two rounds.
+5. **Free Agency** — Re-sign your own players, then open market begins. Salary cap governs what you can afford.
+6. **Repeat** — Each season compounds on the last; player careers, retirements, and dynasty-building span many seasons.
+
+The Play Menu is the central UI control — a single button that drives the player through each phase of the season, with options to stop at any meaningful decision point.
+
+**Soccer GM analog:** We mirror this loop exactly, replacing basketball phases with soccer equivalents (preseason, league season, cup competitions, transfer windows, promotion/relegation).
+
+---
+
+### 3. Roster Management
+
+- Maximum roster size: 15 players (minimum: 5 to play games)
+- Players have individual ratings (0–100 scale) across multiple attributes: shooting, rebounding, passing, dribbling, defense, athleticism, etc.
+- Overall rating is a composite, but raw attribute mix matters — a player's teammates and team system affect output
+- Roster page shows how each player was acquired (drafted, traded, free agent signed) via an "Acquired" column
+- Players can be released, but guaranteed contracts still count against the cap
+
+**Soccer GM analog:** We will manage squads of 25, with positions (GK, CB, LB, RB, CM, CAM, ST, etc.) and attribute ratings (pace, dribbling, passing, shooting, defending, physical). A "How acquired" column is similarly useful for immersion.
+
+---
+
+### 4. Player Ratings & Scouting
+
+- Player ratings are hidden behind a **scouting system** — what the GM sees are estimates, not true values
+- Higher scouting budget → more accurate ratings (effect is gradual, takes ~3 seasons to fully reflect)
+- Ratings displayed on a 0–100 scale
+- Special attributes: Offensive IQ (OIQ) and Defensive IQ (DIQ) replace simpler block/steal ratings
+- Potential (POT) is a hidden rating indicating a player's development ceiling
+
+**Soccer GM analog:** Scouting is a core system in soccer management games. We will implement a similar fog-of-war on ratings for unknown players, with scouting spend improving accuracy over time. Youth players will have high potential but uncertain ratings.
+
+---
+
+### 5. Salary Cap & Contracts
+
+Basketball GM models a nuanced salary cap system:
+
+- **Default cap:** $90M (soft cap)
+- **Luxury tax threshold:** $100M — exceeding it triggers a 150% tax penalty on the overage
+- **Soft cap rules:** Teams can exceed the cap to re-sign their own players, but cannot exceed it to sign free agents from other teams
+- **Hard cap mode** (optional): No exceptions — you cannot exceed the cap to re-sign or trade
+- Contracts are fully guaranteed for non-rookies; releasing a player still costs cap space
+- Rookie contracts are not guaranteed until the regular season starts (releasing before then costs nothing)
+- Player mood traits influence whether they'll negotiate and what they demand (affected by team success, facilities, city size, difficulty)
+
+**Soccer GM analog:** Soccer uses wage budgets and transfer fees rather than a salary cap. We will implement a weekly wage budget and transfer budget (separate pools), with Financial Fair Play rules as an optional hard constraint mode. Contract length, release clauses, and agent fees all add depth.
+
+---
+
+### 6. Draft System
+
+- Two-round draft modeled after the NBA
+- Order based on regular season + playoff performance (worst teams pick first)
+- No lottery by default, but configurable
+- Undrafted players enter free agency
+- Settings for draft prospect age ranges and forced retirement age
+
+**Soccer GM analog:** We will implement a youth academy / scouting system for developing homegrown players, plus a transfer market (the soccer equivalent of free agency and trades). Transfer windows (January + Summer) replace the single draft event.
+
+---
+
+### 7. Trades
+
+- Players and draft picks can be exchanged between teams
+- A "What would make this deal work?" button suggests modifications to proposed trades
+- Trading block feature: list players you're willing to move; AI teams make offers
+- AI uses improved trade-finding algorithms to make smarter offers
+- The AI considers roster fit when making decisions (avoids stacking the bench with elite players)
+
+**Soccer GM analog:** Transfer negotiations in Soccer GM will be the equivalent of trades, with bid/offer mechanics, player valuation, and AI clubs that have their own needs and budgets.
+
+---
+
+### 8. Player Development & Aging
+
+- Players develop naturally each preseason based on age
+- Young players tend to improve; veterans plateau and eventually decline
+- Injuries have lasting effects: serious injuries (25+ games) can permanently reduce athleticism ratings
+- Injury risk increases with age
+- Real player determinism (RPD) setting: historical real players follow their real-world development arcs
+
+**Soccer GM analog:** Development curves will follow realistic soccer career trajectories (peak at 26–29, physical decline earlier). Youth player development will be a key system — investing in youngsters vs. buying proven talent is a central strategic decision.
+
+---
+
+### 9. Finances & Team Management
+
+- Team finances include player salaries, scouting budget, coaching budget, facilities budget, and health/training budget
+- Scouting budget directly affects how accurately the GM sees player ratings
+- Owner sends an annual performance evaluation; poor performance leads to firing
+- The GM History page tracks your record across all teams managed
+- After getting fired, you can take over a new team (or switch proactively)
+- AI teams reset their finance settings each year to avoid runaway imbalance
+
+**Soccer GM analog:** We will track club finances: wage bill, transfer spend/income, matchday revenue, prize money, and commercial income. Board expectations (win ratio, cup runs, youth development) determine job security.
+
+---
+
+### 10. Simulation Engine
+
+- Full box score generated for every game (points, assists, rebounds, blocks, steals, turnovers, etc.)
+- Simulation runs in a background Web Worker / Shared Worker, keeping the UI responsive
+- Play-by-play events can be viewed in real time or skipped
+- Top 8 teams per conference make the playoffs; best-of-7 bracket format
+- Configurable: number of conferences, divisions, playoff teams (any power of 2)
+
+**Soccer GM analog:** We will generate full match stats (goals, shots, passes, possession, cards, etc.) per game with optional play-by-play. Leagues will use standard soccer formats: round-robin group stage + knockout rounds for cups; promotion/relegation for leagues.
+
+---
+
+### 11. God Mode & Customization
+
+Basketball GM offers deep customization through "God Mode":
+
+- Edit any player's ratings, age, contract, or team
+- Adjust league rules (salary cap, playoff format, number of teams)
+- Challenge modes: no draft picks, no free agents, no trades, no visible ratings
+- Custom league files and community-shared rosters (via Reddit)
+- Real player rosters available for historical replays
+
+**Soccer GM analog:** We will offer an equivalent editor mode for power users — adjusting player stats, injecting custom clubs, editing league structure. This is a massive driver of community engagement and replayability.
+
+---
+
+### 12. Technical Architecture
+
+Basketball GM is built entirely in client-side JavaScript with no server-side game logic:
+
+| Layer | Technology |
+|---|---|
+| UI Framework | React + Bootstrap |
+| Language | TypeScript |
+| Data Storage | IndexedDB (client-side) |
+| Performance Layer | Cache layer on top of IndexedDB (`Cache.ts`) |
+| Background Processing | Shared Worker (or Web Worker fallback) |
+| Build Tool | Node.js 24 + pnpm 10 |
+| Static Sites | Eleventy |
+| Tests | `*.test.ts` unit/integration tests + one E2E season simulation test |
+
+**Why this architecture matters:**
+- No backend means zero server costs and infinite scalability (the game runs on the player's machine)
+- IndexedDB allows unlimited save data persisted in the browser
+- Shared Worker allows multiple tabs to view the same league simultaneously without duplication
+- The background worker keeps the UI responsive during heavy simulations
+
+**Soccer GM architecture decision:** We will target a similar fully client-side architecture. This eliminates hosting costs, removes latency, and allows offline play — all critical for a free game aiming for wide adoption.
+
+---
+
+### 13. Game Modes & Replayability
+
+- **New League:** Randomly generated players, fully customizable rules
+- **Real Players:** Import historical or current real player rosters
+- **Historical Leagues:** Simulate from a past era with real rosters
+- **Challenge Modes:** Hard constraints (no trades, no free agents, no visible ratings) for expert players
+- **Multiple simultaneous leagues:** Dashboard lets you manage many separate leagues
+
+**Soccer GM analog:** We will support: new league with random clubs/players, real club/player data imports, historical era replays, and difficulty tiers.
+
+---
+
+### 14. UX Philosophy
+
+Basketball GM explicitly avoids mandatory micromanagement. From the ZenGM design philosophy:
+
+> "Simulation games need depth, but with a UI to help you make sense of it, avoiding mandatory micromanagement as much as possible. Video games should be fun, not tedious."
+
+Key UX patterns:
+- Single large Play button drives all game progression
+- Every important decision is surfaced at the right moment (e.g., re-signing offers appear before free agency, not mid-season)
+- Players can simulate at any granularity (1 game, 1 week, until playoffs, full season)
+- Multi-tab support: view roster in one tab, league standings in another
+
+**Soccer GM UX principle:** Match this philosophy. The game should always guide the user to the next decision. Never strand them wondering what to do next. The session cadence should feel satisfying — a full season playable in 20–30 minutes for casual players, much deeper for enthusiasts.
+
+---
+
+### 15. Monetization & Business Model
+
+Basketball GM is completely free:
+- No ads
+- No microtransactions
+- No paywalled features
+- ZenGM offers a **Patron** tier (voluntary subscription) for users who want to support development and get minor cosmetic/convenience perks
+
+This model builds massive trust and an extremely loyal community. Revenue comes from a small percentage of deeply engaged users, not from extractive monetization of casual ones.
+
+**Soccer GM monetization approach:** We will launch 100% free. Optional patronage or cosmetic customization (kit colors, stadium names, badge design) can be explored post-launch. Pay-to-win mechanics are permanently off the table.
+
+---
+
+### 16. Community & Distribution
+
+- No app store — distributed purely via URL (basketball-gm.com)
+- Community shares custom rosters, mods, and strategies on Reddit and Discord
+- Open-source codebase (source-available on GitHub under a custom license) invites modders and contributors
+- 7 million leagues created organically, primarily through word of mouth and search
+
+**Soccer GM distribution:** Launch via direct URL. Build Reddit and Discord communities early. Consider open-sourcing the simulation engine to attract contributor energy and modder creativity.
+
+---
+
+### Summary: What Soccer GM Will Take from Basketball GM
+
+| Basketball GM Feature | Soccer GM Implementation |
+|---|---|
+| Free, browser-based, client-side | Same — zero server-side game logic |
+| Soft/hard salary cap | Wage budget + Financial Fair Play mode |
+| Draft system | Transfer windows (Jan + Summer) + Youth Academy |
+| Trade mechanic | Transfer negotiations with AI clubs |
+| Scouting fog-of-war | Same — budget affects rating accuracy |
+| Player development + aging | Same — with soccer-specific career arcs |
+| God Mode editor | Same — full league/player editing mode |
+| Play Menu flow | Same UX pattern — single button driving progression |
+| Real player rosters | Real club + player data imports |
+| Multi-league dashboard | Same |
+| No mandatory micromanagement | Core UX principle for Soccer GM |
+| Patron monetization | Same model post-launch |
+
+Basketball GM is the gold standard for this genre. Soccer GM will be its spiritual successor for the global football audience.
+
+---
+
+Sources:
+- [Basketball GM](https://basketball-gm.com/)
+- [ZenGM](https://zengm.com/)
+- [Basketball GM Manual](https://basketball-gm.com/manual/)
+- [ZenGM GitHub Repository](https://github.com/zengm-games/zengm)
+- [Basketball GM 4.0 Technical Details](https://zengm.com/blog/2017/04/basketball-gm-4-0-technical-details/)
+- [ZenGM Blog — New Features](https://zengm.com/blog/tag/new-feature/)
+- [ZenGM Changelog](https://zengm.com/changelog/)
