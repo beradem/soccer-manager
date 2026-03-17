@@ -264,3 +264,483 @@ Sources:
 - [Basketball GM 4.0 Technical Details](https://zengm.com/blog/2017/04/basketball-gm-4-0-technical-details/)
 - [ZenGM Blog — New Features](https://zengm.com/blog/tag/new-feature/)
 - [ZenGM Changelog](https://zengm.com/changelog/)
+
+---
+
+## Deep Research: How Basketball GM's Game Simulation Engine Works
+
+This section documents the technical internals of Basketball GM's game simulation engine in detail, based on analysis of the open source code at `src/worker/core/GameSim.basketball/index.ts` and related files. This serves as the primary technical reference for designing Soccer GM's own match engine.
+
+---
+
+### Overview: What Kind of Simulation Is It?
+
+Basketball GM uses a **possession-by-possession, play-by-play simulation**. Every single possession in every game is individually resolved using probability calculations derived from player ratings. This is the highest-fidelity approach to sports simulation — as opposed to a "box score sim" that just rolls dice for totals — and produces realistic play-by-play logs, accurate per-player stat distribution, and emergent game narratives (comebacks, hot streaks, foul trouble, clutch moments).
+
+The simulation runs inside a **Shared Worker** (background thread), keeping the UI fully responsive even while computing thousands of possessions per second. In 2017, "Project Iverson" achieved a 10x performance improvement in simulation speed through algorithmic and architecture optimizations, enabling fast-forward through entire seasons in seconds.
+
+---
+
+### Player Ratings: The Foundation
+
+Every player has **15 core atomic ratings** on a 0–100 scale:
+
+| Rating Key | Full Name | What It Governs |
+|---|---|---|
+| `hgt` | Height | Blocking, rebounding, interior scoring, defense |
+| `stre` | Strength | Defense, rebounding, low-post scoring |
+| `spd` | Speed | Ball handling, fast breaks, perimeter defense |
+| `jmp` | Jumping | Finishing at rim, rebounding, shot blocking |
+| `endu` | Endurance | How quickly fatigue degrades all other ratings |
+| `ins` | Inside Scoring | Low-post and interior shot accuracy |
+| `dnk` | Dunking | At-rim finishing and dunk frequency |
+| `ft` | Free Throw | Free throw accuracy |
+| `fg` | Mid-Range FG | Mid-range two-point accuracy |
+| `tp` | Three-Point | Three-point shot accuracy |
+| `oiq` | Offensive IQ | Decision-making, usage, shot selection |
+| `diq` | Defensive IQ | Defensive positioning, help defense |
+| `drb` | Dribbling | Ball handling, turnover avoidance |
+| `pss` | Passing | Assist generation, turnover avoidance |
+| `reb` | Rebounding | Both offensive and defensive rebounding |
+
+A critical design insight: **OIQ and DIQ are multipliers, not additive stats.** Young players almost universally have low OIQ/DIQ — raw talent exists but lacks the intelligence to leverage it. As players age and gain experience, improvement comes primarily from basketball IQ amplifying their existing physical skills. This models real-world athletic development realistically.
+
+Another key design choice: ratings are bounded 0–100 but the full range is commonly used across the population of players. Early builds had rating inflation issues (e.g., 5 players all with 100 three-point rating simultaneously). The solution was calibrating distributions so ratings mean something relative to the historical distribution of real NBA players.
+
+---
+
+### Composite Ratings: From Atoms to Simulation Inputs
+
+Raw ratings are never used directly in simulation calculations. Instead, they are combined into **composite ratings** — weighted linear combinations of multiple atomic ratings, normalized to a 0–1 scale. A `power` parameter can then be applied for nonlinear scaling.
+
+Key composite ratings used in simulation:
+
+| Composite | Description | Component Ratings (example weights) |
+|---|---|---|
+| `pace` | How fast a team pushes the tempo | `spd`, `jmp`, `dnk`, `tp`, `drb`, `pss` |
+| `usage` | Tendency to be the primary ball-handler | `ins`, `dnk`, `fg`, `tp`, `spd`, `hgt`, `drb`, `oiq` |
+| `dribbling` | Ball-handling ability | `drb`, `oiq` |
+| `passing` | Playmaking ability | `pss`, `oiq` |
+| `shootingAtRim` | Finishing near the basket | `hgt`, `stre`, `spd`, `jmp`, `ins`, `dnk`, `oiq` |
+| `shootingLowPost` | Low-post scoring | `hgt`, `stre`, `jmp`, `ins`, `oiq` |
+| `shootingMidRange` | Mid-range jump shots | `fg`, `oiq` |
+| `shootingThreePointer` | Three-point shooting | `tp`, `oiq` (and `-oiq` penalty for poor shooters) |
+| `shootingFt` | Free throw accuracy | `ft`, `oiq` |
+| `rebounding` | Securing missed shots | `hgt`, `stre`, `jmp`, `endu`, `reb`, `oiq` |
+| `turnovers` | Tendency to turn the ball over | `drb`, `pss`, `oiq` (inverted — higher = better) |
+| `stealing` | Ability to generate steals | `spd`, `diq` |
+| `blocking` | Shot blocking ability | `hgt`, `jmp`, `diq` |
+| `defensePrimeter` | Perimeter defensive ability | `spd`, `jmp`, `diq` |
+| `defenseInterior` | Interior defensive ability | `hgt`, `stre`, `jmp`, `diq` |
+| `endurance` | Stamina and fatigue resistance | `endu`, `stre` |
+
+The conversion formula for each composite rating is roughly:
+```
+compositeRating = clamp(sum(weight_i × rating_i / 100) / sum(weights), 0, 1) ^ power
+```
+
+The `power` parameter allows ratings to cluster in the middle (power < 1) or spread toward extremes (power > 1). An inverted composite (power = -1) converts a "bad" quality into its inverse.
+
+**Exact composite weights from the source (representative examples):**
+- `passing`: drb × 0.4 + pss × 1.0 + oiq × 0.5
+- `rebounding`: hgt × 2.0 + jmp × 2.0 + reb × 2.0 + oiq × 0.5 + diq × 0.5
+- `turnovers`: constant 50 × 0.5 + ins × 1.0 + pss × 1.0 + oiq × -1.0 (inverted — lower is worse)
+- `usage`: ins × 1.5 + dnk × 1.0 + fg × 1.0 + tp × 1.0 + spd × 0.5 + hgt × 0.5 + drb × 0.5 + oiq × 0.5
+- `shootingAtRim`: hgt × 2.0 + stre × 0.3 + dnk × 0.3 + oiq × 0.2
+- `shootingLowPost`: hgt × 1.0 + stre × 0.6 + spd × 0.2 + ins × 1.0 + oiq × 0.4
+- `shootingThreePointer`: tp × 1.0 + oiq × 0.1
+
+---
+
+### OVR Formula: From Ratings to Overall
+
+The OVR (overall) rating is a Z-score-normalized linear combination derived by regression against simulated plus/minus data:
+
+```
+OVR = 0.159(hgt−47.5) + 0.0777(stre−50.2) + 0.123(spd−50.8) + 0.051(jmp−48.7)
+    + 0.0632(endu−39.9) + 0.0126(ins−42.4) + 0.0286(dnk−49.5) + 0.0202(ft−47.0)
+    + 0.0726(tp−47.1) + 0.133(oiq−46.8) + 0.159(diq−46.7) + 0.059(drb−54.8)
+    + 0.062(pss−51.3) + 0.01(fg−47.0) + 0.01(reb−51.4) + 48.5
+```
+
+The highest coefficients are **height** and **defensive IQ** (both 0.159), followed by **offensive IQ** (0.133) and **speed** (0.123). A piecewise fudge factor adjusts for historical consistency, then the result is clamped to 0–100. OVR is used for roster evaluation and trade logic but is not used inside `simPossession()` — composite ratings drive actual game outcomes.
+
+---
+
+### Team Composite Ratings: The Five-Man Unit
+
+Simulation doesn't use individual player composites directly — it uses **team composite ratings** computed from all five players currently on the court. These are updated **once per possession**, after substitutions and synergy are recalculated.
+
+Formula:
+```
+teamRating[type] = (Σ over 5 players: compositeRating[type] × fatigueMultiplier × performanceFactor × foulFactor) / 5
+                 + synergyBonus[type]
+```
+
+Each of the four multiplicative adjustments:
+
+1. **`fatigueMultiplier`**: Scales 0–1 based on player energy. A fully fresh player has multiplier 1.0; an exhausted player drops toward ~0.6–0.7.
+
+2. **`performanceFactor`**: A `tanh`-based penalty for trailing teams:
+   ```
+   performanceFactor = 1 - 0.2 × tanh(scoreDiff / 60)
+   ```
+   A team down by 30 runs at ~85% effectiveness. This models the psychological and tactical reality that large deficits demoralize teams.
+
+3. **`foulFactor`**: Players in deep foul trouble (e.g., 4 fouls in a game) have their contribution reduced (factor 0.1–1.0). This also increases the likelihood they get subbed out.
+
+4. **`synergyBonus`**: A flat additive bonus from team skill combinations (see Synergy section below).
+
+---
+
+### Synergy: Team-Level Skill Combinations
+
+Beyond individual player composite ratings, Basketball GM models **team synergy** — the idea that certain skill combinations at the team level unlock additional performance bonuses.
+
+Synergy is calculated by counting the "presence" of each skill across all five players on court using sigmoid-shaped threshold functions:
+```
+sigmoid(x, k=15, midpoint) = 1 / (1 + e^(-k × (x - midpoint)))
+skillPresence[player] = sigmoid(compositeRating[type][player], 15, midpoint)
+teamSynergy[skill] = sum(skillPresence across 5 players)  // ~0 to 5
+```
+
+Example: `skillsCount["3"] += sigmoid(p.compositeRating.shootingThreePointer, 15, 0.59)` — a player with a shootingThreePointer composite of 0.59 contributes exactly 0.5 to the three-point synergy count. A great shooter (0.8) contributes ~0.95; a non-shooter (0.3) contributes ~0.02.
+
+`synergyFactor = 0.1` in regular season, `0.25` in playoffs. The synergy total feeds back into team composite ratings as an additive bonus.
+
+**Offensive synergy categories:**
+- Three-point shooting (rewards teams with multiple good shooters — spacing effect)
+- Dribble-drive creation (ball handlers that generate penetration)
+- Passing/playmaking (multiple passers create ball movement)
+- Low-post presence
+
+**Defensive synergy categories:**
+- Perimeter defense (multiple good perimeter defenders)
+- Interior defense / shot blocking
+- Athleticism / help defense rotation speed
+
+**Rebounding synergy:**
+- Teams with multiple rebounders compound the advantage
+
+Each synergy type adds a small bonus (typically +0.01–0.05) to the corresponding team composite rating. This incentivizes building balanced rosters with complementary skills rather than stacking one archetype.
+
+---
+
+### The Main Simulation Loop
+
+At the top level, the simulation follows this structure:
+
+```
+simGame():
+  initialize()           // Set lineups, jump ball for possession, compute initial synergy
+  simRegulation()        // Run 4 quarters
+  if tied: simOvertime() // Run overtime periods until resolved
+  return gameResult      // Full box score + play-by-play log
+```
+
+Within each period:
+```
+simPeriod():
+  while clock > 0 and game not over:
+    simPossession()
+    checkEndOfPeriod()
+    if dead ball: checkSubstitutions()
+    checkElamEnding()   // Special target-score ending mode
+```
+
+**Key detail:** Team assignments inside `simPossession` are swapped at the top of each iteration (offense ↔ defense), meaning the possession that was just played's defense becomes the new offense. This is a coding convention to simplify state management.
+
+---
+
+### Possession Resolution: `getPossessionOutcome()`
+
+This is the heart of the simulation. Each possession ends in exactly one of these outcomes:
+
+1. **Turnover (no steal)** — Offensive team commits a bad pass/handling error, defense recovers
+2. **Turnover (steal)** — Defense actively intercepts; may trigger fast break
+3. **Shot attempt** — Leads to:
+   - Made field goal (2 or 3 points)
+   - Made field goal + and-one foul opportunity
+   - Missed shot → rebound resolution
+   - Blocked shot → rebound resolution
+4. **Non-shooting foul** → Free throws
+
+Resolution proceeds through a decision tree of probability checks:
+
+#### Step 1: Turnover Check
+
+```
+probTov = turnoverFactor × (0.14 × teamDefenseRating) / (0.5 × (teamDribbling + teamPassing))
+```
+
+If `random() < probTov`, possession ends in turnover. Then check for steal:
+```
+probStl = stealFactor × (0.45 × teamDefensePerimeter) / (0.5 × (teamDribbling + teamPassing))
+```
+Steal rate affects whether the defense gets a fast break opportunity on the next possession.
+
+#### Step 2: Shot Selection
+
+If no turnover, a shot is attempted. The simulation first selects **which player shoots** using weighted random selection:
+```
+weights[player] = compositeRating.usage[player] × fatigueMultiplier[player]
+shooterIndex = weightedRandomSelect(weights)
+```
+
+Then selects **shot type** based on the shooter's relative strengths:
+```
+atRimWeight = compositeRating.shootingAtRim
+lowPostWeight = compositeRating.shootingLowPost
+midRangeWeight = compositeRating.shootingMidRange
+threeWeight = compositeRating.shootingThreePointer
+```
+Shot type chosen by weighted random among the four types. This produces realistic shot distributions: a center takes mostly at-rim and low-post shots; a shooter takes mostly threes.
+
+#### Step 3: Block Check
+
+If a shot is attempted:
+```
+probBlk = blockFactor × 0.2 × defenderBlockingRating²
+```
+If blocked, the possession continues to rebound resolution (either defense secures it or offense tips it in).
+
+#### Step 4: Shot Accuracy
+
+Base accuracy per shot type (approximate values from source):
+- **At rim**: 0.45–0.68 (depends heavily on athleticism and interior defense)
+- **Low post**: 0.38–0.58
+- **Mid-range**: 0.35–0.52
+- **Three-pointer**: 0.28–0.44
+
+Actual make probability per possession:
+```
+probMake = baseRate - (defenseWeight × teamDefenseRating) + synergyOffensiveBonus
+probMake × fatigueMultiplier
+```
+
+#### Step 5: And-One / Foul Check
+
+If shot made:
+```
+probAndOne = andOneFactor[shotType]  // ~0.01 for threes, ~0.15 for at-rim
+```
+If shot missed:
+```
+probFoulOnMiss = foulFactor[shotType]  // triggers free throw opportunity
+```
+
+#### Step 6: Rebound Resolution
+
+After a missed (and non-fouled) shot:
+```
+probDrb = (0.75 × (2 + teamDefRebounding)) / (orbFactor × (2 + teamOffRebounding))
+```
+If `random() < probDrb`, defense secures the rebound (possession ends). Otherwise, offense retains possession for a put-back opportunity.
+
+The individual rebounder is selected by weighted random:
+```
+weights[player] = compositeRating.rebounding × fatigueMultiplier
+```
+
+---
+
+### Fatigue: Energy Depletion and Recovery
+
+Every player on court continuously loses energy:
+```
+energy -= minutesPlayedThisPossession × 0.055 × (1 - compositeRating.endurance)
+```
+
+Energy recovers on the bench:
+```
+energy += minutesBenched × 0.094 × (1 - compositeRating.endurance)
+```
+(Higher endurance rating → slower drain, faster recovery)
+
+Energy converts to a fatigue multiplier applied to all composite ratings:
+```
+fatigueMultiplier = fatigue(energy) = (energy + factor) / (1 + factor)
+```
+
+Where `factor` is **dynamic**, not constant:
+- **Late game / Elam active**: `factor = 2` (fatigue has less impact; stars stay sharp)
+- **Normal play**: `factor = 6 - clockSeconds/60` (impact increases as time runs down)
+
+This elegant formula means fatigue is almost irrelevant in the first few minutes of a period (factor ≈ 6, so even energy=0 gives 0.14 multiplier vs 1.0 for full energy — a 14% floor), but becomes significant in late-game crunch time when factor=2 means the floor is 0.33. Players with high endurance ratings effectively keep `energy` higher, so their fatigue multiplier stays closer to 1.0 throughout.
+
+**Fatigue impact is reduced in late-game situations** (final 6 minutes of regulation, final 2 minutes of overtime). This reflects real-world adrenaline effects and prevents unrealistic late-game collapses from pure exhaustion.
+
+**Fatigue also drives substitution logic:** The auto-substitution system evaluates player energy levels and foul trouble each dead ball and swaps in fresher players when appropriate. Coaches (the AI) try to distribute minutes to keep key players fresh for crunch time.
+
+---
+
+### Foul System
+
+Fouls are tracked per player, per quarter, and per team. Key mechanics:
+
+- **Team foul bonus**: After N team fouls in a quarter (default: 5), every subsequent defensive foul sends the offensive player to the line
+- **Personal foul trouble**: A player approaching their foul limit (e.g., 4 fouls) has their `foulFactor` reduced (lowering their defensive contribution) and becomes a substitution priority
+- **Intentional fouling**: `shouldIntentionalFoul()` triggers when ALL conditions are met:
+  - Leading team ahead by 1–6 points
+  - Final period or overtime
+  - Clock between 0.3 and 27 seconds remaining
+  - Team foul count ≤ 10 (within reasonable fouls-until-bonus threshold)
+  Targets the opposing team's worst free throw shooter
+- **Last-two-minutes rule**: Separate foul counter for the final 2 minutes per quarter, preventing early-foul banking
+
+Foul trouble is a major strategic dimension: a star player in early foul trouble forces a difficult decision between sitting them out (losing their contribution) or risking fouling out.
+
+---
+
+### Clock and Pace Management
+
+Base clock consumption per possession is driven by a **pace factor**:
+```
+clockUsed = basePossessionLength × paceFactor × randomVariance
+paceFactor = team[o].compositeRating.pace  // Faster teams = shorter possessions
+```
+
+The simulation also models specific late-game clock strategies:
+
+| Situation | Strategy |
+|---|---|
+| 32–52 seconds left in period | "Two-for-one": offense rushes shot to get another possession before the buzzer |
+| ≤26 seconds left in period | "Last shot hold": offense milks clock for the final shot |
+| Winning team, final period | "Run out clock": offense drains time to deny opponent possessions |
+| Losing team late | Forces faster tempo, increases three-point frequency |
+
+These behaviors emerge from the simulation's probability calculations, not scripted events — the AI reacts to clock and score state every possession.
+
+---
+
+### Box Score Generation
+
+Every possession appends events to a running play-by-play log and updates per-player stat accumulators:
+
+**Per-player tracked stats:**
+- `pts` (points), `fgAttempted`, `fgMade`, `tpAttempted`, `tpMade`, `ftAttempted`, `ftMade`
+- `orb` (offensive rebounds), `drb` (defensive rebounds), `ast` (assists), `tov` (turnovers)
+- `stl` (steals), `blk` (blocks), `ba` (blocks absorbed), `pf` (personal fouls)
+- `min` (minutes played), `energy` (final energy level)
+- Plus/minus: `+/-` tracked per possession
+
+**Team-level stats:**
+- Running score, timeouts remaining, foul counts per quarter
+
+Advanced stats (PER, Win Shares, BPM, VORP) are computed post-simulation from box score totals using known basketball statistics formulas.
+
+---
+
+### Overtime and Special Modes
+
+**Overtime:** Simulated identically to regulation periods but with configurable length (default: 5 minutes) and the same possession-based engine.
+
+**ELAM Ending (optional):** A target-score mode where, once a certain clock threshold is hit, the game ends when any team reaches a target score (current score + N points). This eliminates intentional fouling in late-game situations and is configurable per league.
+
+**Playoffs vs Regular Season:** Two explicit changes apply when playoffs are detected:
+```
+fatigueFactor /= 1.85     // ~46% less fatigue — stars play more minutes, fewer rotations
+synergyFactor × 2.5       // Team chemistry/fit matters 2.5× more than regular season
+```
+This means roster depth matters less in the playoffs (stars can carry heavier loads) but team construction quality matters more (mismatched rosters are punished harder). Fewer upsets overall. Rest days between series games allow partial energy recovery via the bench recovery formula.
+
+---
+
+### Player Selection for Individual Actions
+
+Throughout the simulation, when the code needs to pick **which specific player** performs an action (shooter, rebounder, assister, fouler), it uses `pickPlayer(ratingArray, exempt?)`:
+
+```typescript
+// 1. Build weight array (power creates nonlinear concentration)
+weights = players.map(p => compositeRating[type][p] ^ power)
+
+// 2. Optionally zero out exempt player (e.g., can't assist your own shot)
+if (exempt) weights[exempt] = 0
+
+// 3. Weighted random draw
+totalWeight = sum(weights)
+r = random() * totalWeight
+// Iterate cumulative sum to find selected index
+
+// 4. Edge case: if all weights 0, select uniformly at random
+```
+
+The `power` parameter controls concentration. For steals, `power = 5` is used — meaning the best defensive player has a *massively* disproportionate chance of getting the steal. For rebounds, `power = 1` distributes chances more proportionally. This accurately reflects real basketball: the best defender initiates most steals, but rebounds are more randomly contested.
+
+**Jump Ball** uses a cubic power:
+```
+prob = 0.5 × (player0.jumpBall / player1.jumpBall)³
+```
+The cubic exponent means a player with a significantly higher jumpBall rating wins the jump ball with very high probability — rare upsets still occur but are uncommon.
+
+---
+
+### Performance Architecture
+
+The simulation is designed for speed because thousands of games must simulate per season:
+
+- **Zero UI rendering during simulation**: All computation happens in the background Shared Worker; UI updates only after full game completion (or at explicit play-by-play pause points)
+- **No async/await in the inner loop**: The hot path (possession resolution) is fully synchronous — no promises, no waiting
+- **Pre-computed lookup tables**: Synergy sigmoid thresholds and other frequently-computed values are cached, not recalculated each possession
+- **Team composite ratings updated once per possession** (not per play within a possession), batching the expensive weighted-average calculation
+
+A full 82-game NBA season (each game ~200 possessions) = ~16,400 possessions to simulate. Basketball GM simulates full seasons in ~1 second in modern browsers.
+
+---
+
+### Key Design Principles to Carry Forward Into Soccer GM
+
+From deep study of Basketball GM's simulation engine, these are the principles that matter most:
+
+1. **Composite ratings as simulation inputs, never raw ratings.** Raw attributes must be combined into meaningful composites (e.g., "finishing ability" from pace + strength + technique) before entering probability calculations.
+
+2. **Possession/event-based simulation, not aggregate rolling.** Each discrete event (shot, duel, interception) is individually resolved. This produces realistic per-player stat distributions and authentic play-by-play narratives.
+
+3. **Bounded probabilities.** Every probability is clamped to `[0.001, 0.999]` to prevent division-by-zero and probability collapse edge cases.
+
+4. **Multiplicative fatigue on all ratings, not additive.** Fatigue as a multiplier (rather than subtracted flat amount) preserves relative player differences while uniformly degrading performance — a 90-rated player tired is still better than an 80-rated player fresh.
+
+5. **Performance factor for score differential.** The `tanh`-based penalty for trailing teams (and bonus for leading teams) creates natural game dynamics without scripted "momentum" — large leads are psychologically and tactically self-reinforcing.
+
+6. **Synergy rewards balanced rosters.** Skill combination bonuses incentivize building diverse squads rather than stacking one attribute. This makes roster construction decisions more interesting.
+
+7. **Weighted random selection, not deterministic assignment.** Even in a single possession, variance is preserved — the best player doesn't always shoot; the best rebounder doesn't always grab the board. This produces realistic game-to-game and season-level variance.
+
+8. **Late-game AI strategy must be baked in.** Clock management, intentional fouling, shot selection adjustments, and tempo changes in the final minutes make games feel realistic and strategic. These are not cosmetic — they change outcomes.
+
+---
+
+### How Soccer GM Will Apply These Principles
+
+| Basketball GM Concept | Soccer GM Equivalent |
+|---|---|
+| Possession (offense vs defense) | Attack phase (team with ball vs defensive shape) |
+| Shot types (at-rim / mid-range / 3pt) | Chance types (through-ball through box / shot outside box / header / 1v1) |
+| Turnover (steal/bad pass) | Interception / clearance / bad touch → counterattack |
+| Offensive rebound | Second ball after save / clearance → retained possession |
+| Foul + free throws | Foul → free kick / penalty |
+| Player selection weights | Ball carrier / shooter / header target selection weights |
+| Team composite ratings per possession | Team attacking/defensive shape rating per phase |
+| Fatigue depletion by energy | Stamina depletion by minutes played |
+| Pace factor | Pressing intensity / deep-block mentality affects phase length |
+| Score-differential performance factor | Same — teams chasing games change tactics, creating feedback loops |
+| Synergy (passing + dribbling) | Synergy (pressing + high line, or tiki-taka passing combinations) |
+| Intentional fouling late | Time-wasting / parking the bus late |
+| Play-by-play log | Match commentary log (goals, shots, cards, near-misses) |
+| Box score (pts/reb/ast) | Match stats (goals/shots/passes/tackles/interceptions per player) |
+
+---
+
+Sources for Game Simulation Research:
+- [ZenGM GameSim.basketball/index.ts — main simulation engine ~2700 lines (GitHub)](https://github.com/zengm-games/zengm/blob/master/src/worker/core/GameSim.basketball/index.ts)
+- [ZenGM constants.basketball.ts — composite rating weight definitions (GitHub)](https://github.com/zengm-games/zengm/blob/master/src/common/constants.basketball.ts)
+- [ZenGM ovr.basketball.ts — OVR formula by regression (GitHub)](https://github.com/zengm-games/zengm/blob/master/src/worker/core/player/ovr.basketball.ts)
+- [Three improvements to game simulation realism (ZenGM Blog, 2020)](https://zengm.com/blog/2020/07/game-sim-realism/)
+- [Game simulation improvements and tweaks to OVR (ZenGM Blog, 2019)](https://zengm.com/blog/2019/11/game-simulation-ovr-beta/)
+- [The Elam Ending implementation (ZenGM Blog, 2020)](https://zengm.com/blog/2020/08/elam-ending/)
+- [Game simulation settings for all games (ZenGM Blog, 2022)](https://zengm.com/blog/2022/11/game-sim-settings/)
+- [Player ratings and development system (ZenGM Blog, 2018)](https://zengm.com/blog/2018/02/player-ratings-and-development-beta/)
+- [Players can now play through minor injuries (ZenGM Blog, 2021)](https://zengm.com/blog/2021/05/play-through-injuries/)
+- [So you want to write a sports sim game (ZenGM Blog, 2019)](https://zengm.com/blog/2019/07/so-you-want-to-write-a-sports-sim-game/)
+- [New position formula — linear regression from ratings to positions (ZenGM Blog, 2021)](https://zengm.com/blog/2021/03/new-position-formula/)
+- [Basketball GM 4.0 technical details — Shared Worker architecture (ZenGM Blog, 2017)](https://zengm.com/blog/2017/04/basketball-gm-4-0-technical-details/)
